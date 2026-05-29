@@ -141,6 +141,21 @@ def obtener_lista(page):
         print("[lista] el grid no devolvio datos")
         return []
     print("[lista] concursos leidos del grid: %d" % len(datos))
+
+    # Volcar TODOS los campos disponibles del primer concurso (para descubrir
+    # si la fecha de apertura ya viene en la lista o hay que ir al detalle).
+    try:
+        crudo = page.evaluate(
+            "() => { try { var g=$jq1('#gridProcesos').data('kendoGrid');"
+            " var d=g.dataSource.data(); if(!d.length) return null;"
+            " return d[0].toJSON ? d[0].toJSON() : d[0]; } catch(e){ return String(e); } }")
+        (DIR_DEBUG / ("campos_%s.json" % HOY)).write_text(
+            json.dumps(crudo, ensure_ascii=False, indent=2), encoding="utf-8")
+        print("[lista] campos disponibles: %s" % (
+            ", ".join(crudo.keys()) if isinstance(crudo, dict) else crudo))
+    except Exception as e:
+        print("[lista] no se pudieron volcar campos: %s" % e)
+
     return datos
 
 
