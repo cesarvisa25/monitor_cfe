@@ -1,18 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Monitor de concursos de CFE (Micrositio de Concursos / MSC) - v2.1
+Monitor de concursos de CFE (Micrositio de Concursos / MSC) - v2.2
 
-Enfoque robusto: en vez de imitar la peticion AJAX (que el servidor rechaza
-con error 500), el robot hace CLIC en el boton "Buscar" real de la pagina y
-luego lee la tabla de resultados directo de la memoria del navegador
-(el dataSource de Kendo UI). Asi la pagina usa su propio token y todo cuadra.
-
-  1. Abre la pagina y hace clic en "Buscar" (sin filtros = todos los vigentes).
-  2. Lee la lista completa de concursos del grid.
-  3. Detecta los NUEVOS (compara contra estado/vistos.json por numero).
-  4. Filtra por palabras clave: primero en la descripcion; si no, abre el
-     detalle (ventana real) y revisa los anexos PDF.
-  5. Escribe reporte y, si hay hallazgos, genera salida/nuevo_issue.md.
+- Hace clic en "Buscar" filtrando por estado VIGENTE (no historico).
+- Lee la lista del grid de Kendo directamente de la memoria del navegador.
+- Detecta los NUEVOS (compara contra estado/vistos.json por numero).
+- Filtra por palabras clave: primero la descripcion; si no, abre el detalle
+  y revisa los anexos PDF.
+- Escribe un reporte completo y un cuerpo de Issue con tope de tamano.
 """
 
 import io
@@ -39,12 +34,12 @@ DIR_DEBUG = RAIZ / "depuracion"
 
 MAX_ANEXOS = 12
 MAX_PDF_MB = 25
-MAX_DETALLES = 30   # cuantos detalles abrir por corrida (para no eternizarse)
+MAX_DETALLES = 30
+TOPE_ISSUE = 50
 
 HOY = datetime.now().strftime("%Y-%m-%d")
 
 
-# ----------------------- Coincidencias -----------------------
 def normaliza(texto):
     texto = (texto or "").lower()
     texto = unicodedata.normalize("NFKD", texto)
@@ -69,7 +64,6 @@ def buscar_coincidencias(texto):
     return hallazgos
 
 
-# ----------------------- Estado -----------------------
 def cargar_estado():
     if ESTADO.exists():
         try:
@@ -85,7 +79,6 @@ def guardar_estado(vistos):
                       encoding="utf-8")
 
 
-# ----------------------- Lista de concursos -----------------------
 JS_LEER_GRID = r"""
 () => {
   try {
@@ -111,17 +104,21 @@ JS_LEER_GRID = r"""
 
 
 def obtener_lista(page):
-    """Hace clic en Buscar y lee el grid. Devuelve lista de dicts."""
     DIR_DEBUG.mkdir(parents=True, exist_ok=True)
-    # Clic en el boton Buscar
+    # Filtrar a solo VIGENTES (1 = Vigente en el menu #estado)
+    try:
+        page.select_option("#estado", "1")
+        print("[filtro] estado = Vigente")
+    except Exception as e:
+        print("[filtro] no se pudo fijar Vigente: %s" % e)
+    # Clic en Buscar
     try:
         page.click("#buscar", timeout=15000)
     except Exception as e:
         print("[lista] no se pudo clic en #buscar: %s" % e)
 
-    # Esperar a que el grid de Kendo tenga datos (hasta ~40s)
     datos = None
-    for intento in range(40):
+    for _ in range(40):
         page.wait_for_timeout(1000)
         try:
             datos = page.evaluate(JS_LEER_GRID)
@@ -130,7 +127,6 @@ def obtener_lista(page):
         if datos:
             break
 
-    # Guardar evidencia siempre
     try:
         page.screenshot(path=str(DIR_DEBUG / ("pantalla_%s.png" % HOY)),
                         full_page=True)
@@ -143,8 +139,6 @@ def obtener_lista(page):
         print("[lista] el grid no devolvio datos")
         return []
     print("[lista] concursos leidos del grid: %d" % len(datos))
-    (DIR_DEBUG / ("lista_%s.json" % HOY)).write_text(
-        json.dumps(datos, ensure_ascii=False)[:200000], encoding="utf-8")
     return datos
 
 
@@ -166,9 +160,7 @@ def normaliza_concurso(d):
     }
 
 
-# ----------------------- Detalle / anexos -----------------------
 def obtener_anexos(ctx, page, id_proc, guardar_muestra=False):
-    """Abre el detalle (ventana real) via MostrarDetalle y saca URLs de PDF."""
     if not id_proc:
         return []
     pop = None
@@ -212,7 +204,6 @@ def obtener_anexos(ctx, page, id_proc, guardar_muestra=False):
             absolutas.append(BASE + u.lstrip("/"))
     absolutas = list(dict.fromkeys(absolutas))[:MAX_ANEXOS]
 
-    # Descargar y extraer texto de cada PDF (usando la ventana de detalle)
     textos = []
     for url in absolutas:
         try:
@@ -232,37 +223,53 @@ def obtener_anexos(ctx, page, id_proc, guardar_muestra=False):
     return textos
 
 
-# ----------------------- Reporte -----------------------
+def _bloques(hallazgos):
+    lineas = []
+    for h in hallazgos:
+        kws = ", ".join(sorted({k for k, _ in h["coincidencias"]}))
+        lineas += [
+            "## %s  (%s)" % (h["numero"], h["entidad"]),
+            "- **Descripcion:** %s" % h["descripcion"],
+            "- **Fecha publicacion:** %s" % h["fecha"],
+            "- **Palabras encontradas:** %s" % kws,
+            "- **Detectado en:** %s" % h["fuente"],
+        ]
+        if h["coincidencias"]:
+            _, frag = h["coincidencias"][0]
+            lineas.append("- **Contexto:** ...%s..." % frag)
+        lineas.append("")
+    return lineas
+
+
 def escribir_reportes(hallazgos):
     DIR_REPORTES.mkdir(parents=True, exist_ok=True)
     DIR_SALIDA.mkdir(parents=True, exist_ok=True)
-    lineas = ["# Concursos CFE con recubrimientos / pinturas - %s" % HOY, ""]
+    cab = "# Concursos CFE con recubrimientos / pinturas - %s" % HOY
+
+    full = [cab, ""]
     if not hallazgos:
-        lineas.append("Sin coincidencias nuevas hoy.")
+        full.append("Sin coincidencias nuevas hoy.")
     else:
-        lineas.append("**%d concurso(s) con coincidencias:**\n" % len(hallazgos))
-        for h in hallazgos:
-            kws = ", ".join(sorted({k for k, _ in h["coincidencias"]}))
-            lineas += [
-                "## %s  (%s)" % (h["numero"], h["entidad"]),
-                "- **Descripcion:** %s" % h["descripcion"],
-                "- **Fecha publicacion:** %s" % h["fecha"],
-                "- **Palabras encontradas:** %s" % kws,
-                "- **Detectado en:** %s" % h["fuente"],
-            ]
-            if h["coincidencias"]:
-                _, frag = h["coincidencias"][0]
-                lineas.append("- **Contexto:** ...%s..." % frag)
-            lineas.append("")
-    contenido = "\n".join(lineas)
-    (DIR_REPORTES / ("%s.md" % HOY)).write_text(contenido, encoding="utf-8")
-    print("[reporte] %s.md" % HOY)
+        full.append("**%d concurso(s) con coincidencias:**" % len(hallazgos))
+        full.append("")
+        full += _bloques(hallazgos)
+    (DIR_REPORTES / ("%s.md" % HOY)).write_text("\n".join(full),
+                                                encoding="utf-8")
+    print("[reporte] %s.md (%d hallazgos)" % (HOY, len(hallazgos)))
+
     if hallazgos:
-        (DIR_SALIDA / "nuevo_issue.md").write_text(contenido, encoding="utf-8")
+        issue = [cab, "",
+                 "**%d concurso(s) con coincidencias.**" % len(hallazgos)]
+        if len(hallazgos) > TOPE_ISSUE:
+            issue.append("_Mostrando los primeros %d. El listado completo esta "
+                         "en reportes/%s.md del repositorio._" % (TOPE_ISSUE, HOY))
+        issue.append("")
+        issue += _bloques(hallazgos[:TOPE_ISSUE])
+        cuerpo = "\n".join(issue)[:60000]
+        (DIR_SALIDA / "nuevo_issue.md").write_text(cuerpo, encoding="utf-8")
         print("[reporte] salida/nuevo_issue.md generado")
 
 
-# ----------------------- Main -----------------------
 def main():
     vistos = cargar_estado()
     print("[estado] ya vistos: %d" % len(vistos))
@@ -289,6 +296,14 @@ def main():
         crudos = obtener_lista(page)
         concursos = [normaliza_concurso(c) for c in crudos]
         concursos = [c for c in concursos if c["numero"]]
+
+        def es_vigente(c):
+            e = normaliza(c["estado"])
+            return (not e) or ("vigente" in e)
+        antes = len(concursos)
+        concursos = [c for c in concursos if es_vigente(c)]
+        print("[filtro] vigentes=%d (de %d)" % (len(concursos), antes))
+
         nuevos = [c for c in concursos if c["numero"] not in vistos]
         print("[lista] total=%d nuevos=%d" % (len(concursos), len(nuevos)))
 
