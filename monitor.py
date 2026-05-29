@@ -159,6 +159,40 @@ def obtener_lista(page):
     return datos
 
 
+def fmt_fecha(v):
+    """Convierte '/Date(1780030466730)/' a 'dd/mm/yyyy'. Deja igual lo demas."""
+    if not v:
+        return ""
+    s = str(v)
+    m = re.search(r"/Date\((\d+)", s)
+    if m:
+        try:
+            from datetime import timezone, timedelta
+            ts = int(m.group(1)) / 1000.0
+            tz = timezone(timedelta(hours=-6))  # hora del centro de Mexico
+            return datetime.fromtimestamp(ts, tz).strftime("%d/%m/%Y")
+        except Exception:
+            return s
+    return s
+
+
+def extraer_fecha_apertura(html):
+    """Saca la fecha de 'Apertura de Ofertas Tecnicas' del calendario del detalle."""
+    if not html:
+        return ""
+    plano = re.sub(r"\s+", " ", html)
+    fecha = r"(\d{2}/\d{2}/\d{4}(?:\s+\d{1,2}:\d{2}\s*hrs)?)"
+    # 1) lo mas preciso: la etiqueta "Fecha de Apertura de Ofertas Tecnicas"
+    m = re.search(r"Fecha de Apertura de Ofertas T[e\u00e9]cnicas.*?" + fecha,
+                  plano, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # 2) respaldo: el encabezado del panel
+    m = re.search(r"Apertura de Ofertas T[e\u00e9]cnicas.*?" + fecha,
+                  plano, re.IGNORECASE | re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
 def _campo(d, *nombres):
     for n in nombres:
         if n in d and d[n] not in (None, ""):
@@ -171,19 +205,22 @@ def normaliza_concurso(d):
         "numero": str(_campo(d, "Numero", "numero")),
         "descripcion": str(_campo(d, "Descripcion", "descripcion")),
         "entidad": str(_campo(d, "EntidadFederativa", "entidadFederativa")),
-        "fecha": str(_campo(d, "FechaPublicacion", "fechaPublicacion")),
+        "fecha": fmt_fecha(_campo(d, "FechaPublicacion", "fechaPublicacion")),
         "estado": str(_campo(d, "EstadoProcedimiento", "estadoProcedimiento")),
         "tipo_contratacion": str(_campo(d, "TipoContratacionClave",
                                         "tipoContratacionClave")),
         "tipo_procedimiento": str(_campo(d, "TipoProcedimientoClave",
                                          "tipoProcedimientoClave")),
+        "apertura": "",
         "id": str(_campo(d, "Id", "id")),
     }
 
 
-def obtener_anexos(ctx, page, id_proc, guardar_muestra=False):
+def abrir_detalle(ctx, page, id_proc, leer_anexos, guardar_muestra=False):
+    """Abre el detalle y devuelve (html, [textos_pdf]).
+    Si leer_anexos=False solo trae el html (rapido, para la fecha)."""
     if not id_proc:
-        return []
+        return "", []
     pop = None
     try:
         with ctx.expect_page(timeout=20000) as pinfo:
@@ -199,7 +236,7 @@ def obtener_anexos(ctx, page, id_proc, guardar_muestra=False):
                 pop.close()
             except Exception:
                 pass
-        return []
+        return "", []
 
     if guardar_muestra:
         try:
@@ -208,40 +245,39 @@ def obtener_anexos(ctx, page, id_proc, guardar_muestra=False):
         except Exception:
             pass
 
-    urls = set()
-    for m in re.finditer(r'(GetAnexo/\d+)', html, re.IGNORECASE):
-        urls.add(m.group(1))
-    for m in re.finditer(r'href=["\']([^"\']*\.pdf[^"\']*)["\']',
-                         html, re.IGNORECASE):
-        urls.add(m.group(1))
-
-    absolutas = []
-    for u in urls:
-        if u.startswith("http"):
-            absolutas.append(u)
-        elif u.startswith("/"):
-            absolutas.append("https://msc.cfe.mx" + u)
-        else:
-            absolutas.append(BASE + u.lstrip("/"))
-    absolutas = list(dict.fromkeys(absolutas))[:MAX_ANEXOS]
-
     textos = []
-    for url in absolutas:
-        try:
-            resp = pop.request.get(url, timeout=60000)
-            if not resp.ok:
+    if leer_anexos:
+        urls = set()
+        for m in re.finditer(r'(GetAnexo/\d+)', html, re.IGNORECASE):
+            urls.add(m.group(1))
+        for m in re.finditer(r'href=["\']([^"\']*\.pdf[^"\']*)["\']',
+                             html, re.IGNORECASE):
+            urls.add(m.group(1))
+        absolutas = []
+        for u in urls:
+            if u.startswith("http"):
+                absolutas.append(u)
+            elif u.startswith("/"):
+                absolutas.append("https://msc.cfe.mx" + u)
+            else:
+                absolutas.append(BASE + u.lstrip("/"))
+        absolutas = list(dict.fromkeys(absolutas))[:MAX_ANEXOS]
+        for url in absolutas:
+            try:
+                resp = pop.request.get(url, timeout=60000)
+                if not resp.ok:
+                    continue
+                b = resp.body()
+                if len(b) > MAX_PDF_MB * 1024 * 1024 or b[:4] != b"%PDF":
+                    continue
+                textos.append(extract_text(io.BytesIO(b)) or "")
+            except Exception:
                 continue
-            b = resp.body()
-            if len(b) > MAX_PDF_MB * 1024 * 1024 or b[:4] != b"%PDF":
-                continue
-            textos.append(extract_text(io.BytesIO(b)) or "")
-        except Exception:
-            continue
     try:
         pop.close()
     except Exception:
         pass
-    return textos
+    return html, textos
 
 
 def _bloques(hallazgos):
@@ -253,6 +289,7 @@ def _bloques(hallazgos):
             "- **Descripcion:** %s" % h["descripcion"],
             "- **Tipo de contratacion:** %s" % (h.get("tipo_contratacion") or "-"),
             "- **Fecha publicacion:** %s" % h["fecha"],
+            "- **Apertura ofertas tecnicas:** %s" % (h.get("apertura") or "(ver detalle)"),
             "- **Palabras encontradas:** %s" % kws,
             "- **Detectado en:** %s" % h["fuente"],
         ]
@@ -335,21 +372,35 @@ def main():
             vistos.add(c["numero"])
             co = buscar_coincidencias(c["descripcion"])
             fuente = "descripcion" if co else None
-            if not co and detalles < MAX_DETALLES:
+            detalle_html = ""
+
+            if co:
+                # Ya es hallazgo por la descripcion: abrimos detalle solo para
+                # la fecha de apertura (sin descargar los PDF, es mas rapido).
+                detalle_html, _ = abrir_detalle(ctx, page, c["id"],
+                                                leer_anexos=False,
+                                                guardar_muestra=muestra)
+                muestra = False
+            elif detalles < MAX_DETALLES:
+                # No matcheo la descripcion: abrimos detalle y revisamos PDFs.
                 detalles += 1
-                textos = obtener_anexos(ctx, page, c["id"],
-                                        guardar_muestra=muestra)
+                detalle_html, textos = abrir_detalle(ctx, page, c["id"],
+                                                     leer_anexos=True,
+                                                     guardar_muestra=muestra)
                 muestra = False
                 for texto in textos:
                     cc = buscar_coincidencias(texto)
                     if cc:
                         co, fuente = cc, "anexo PDF"
                         break
+
             if co:
                 c["coincidencias"] = co
                 c["fuente"] = fuente
+                c["apertura"] = extraer_fecha_apertura(detalle_html)
                 hallazgos.append(c)
-                print("[HALLAZGO] %s -> %s" % (c["numero"], [k for k, _ in co]))
+                print("[HALLAZGO] %s -> %s | apertura: %s" % (
+                    c["numero"], [k for k, _ in co], c["apertura"] or "-"))
 
         navegador.close()
 
