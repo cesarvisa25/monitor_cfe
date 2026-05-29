@@ -30,7 +30,6 @@ PALABRAS_CLAVE = [
     "primario anticorrosivo",
     "imprimante",
     "imprimador",
-    "primer",
     "rica en zinc",
     "galvanizado en frio",
     "intumescente",
