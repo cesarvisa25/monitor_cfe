@@ -1,0 +1,2 @@
+playwright==1.49.1
+pdfminer.six==20240706
