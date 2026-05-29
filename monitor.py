@@ -1,20 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Monitor de concursos de CFE (Micrositio de Concursos / MSC).
+Monitor de concursos de CFE (Micrositio de Concursos / MSC) - v2
 
-Que hace al correr:
-  1. Abre la busqueda publica del MSC con un navegador real (Playwright).
-  2. Lee la lista de concursos y detecta los NUEVOS (compara contra estado/vistos.json).
-  3. De cada concurso nuevo descarga los anexos PDF y les extrae el texto.
-  4. Marca los concursos cuya descripcion o anexos contengan palabras clave
-     de recubrimientos / pinturas (ver keywords.py).
-  5. Escribe un reporte y, si hay hallazgos, genera salida/nuevo_issue.md
-     (el workflow lo convierte en un Issue de GitHub que te llega por correo).
-
-IMPORTANTE: la funcion extraer_lista_concursos() es la parte que casi
-seguro hay que AFINAR contra la pagina real de CFE. Por eso cada corrida
-guarda en depuracion/ una captura y el HTML de la pagina, para poder
-ajustar los selectores sin tener que entrar al sitio (que bloquea bots).
+Ajustado a la estructura real del portal:
+  - La lista de concursos se obtiene del endpoint Procedure/getProcBusqueda
+    (es lo que hace el boton "Buscar" de la pagina).
+  - El detalle de cada concurso (con sus anexos PDF) se obtiene de
+    Procedure/Details enviando el Id del procedimiento.
 """
 
 import io
@@ -30,12 +22,10 @@ from pdfminer.high_level import extract_text
 
 from keywords import PALABRAS_CLAVE
 
-# ---------------------------------------------------------------------------
-# Configuracion
-# ---------------------------------------------------------------------------
-BASE = "https://msc.cfe.mx"
-# Pagina de entrada de concursos. Desde aqui se intenta llegar a la lista.
-URL_INICIO = "https://msc.cfe.mx/Aplicaciones/NCFE/Concursos/"
+BASE = "https://msc.cfe.mx/Aplicaciones/NCFE/Concursos/"
+URL_INICIO = BASE
+URL_BUSQUEDA = BASE + "Procedure/getProcBusqueda"
+URL_DETALLE = BASE + "Procedure/Details"
 
 RAIZ = Path(__file__).parent
 ESTADO = RAIZ / "estado" / "vistos.json"
@@ -43,47 +33,34 @@ DIR_REPORTES = RAIZ / "reportes"
 DIR_SALIDA = RAIZ / "salida"
 DIR_DEBUG = RAIZ / "depuracion"
 
-# Limite de anexos por concurso para no descargar gigas (ajustable)
 MAX_ANEXOS = 15
-# Tamano maximo de PDF a procesar (MB)
 MAX_PDF_MB = 25
+MAX_DETALLES = 120
 
 HOY = datetime.now().strftime("%Y-%m-%d")
 
 
-# ---------------------------------------------------------------------------
-# Utilidades
-# ---------------------------------------------------------------------------
-def normaliza(texto: str) -> str:
-    """Minusculas + sin acentos, para comparar sin importar tildes."""
-    texto = texto.lower()
+def normaliza(texto):
+    texto = (texto or "").lower()
     texto = unicodedata.normalize("NFKD", texto)
-    texto = "".join(c for c in texto if not unicodedata.combining(c))
-    return texto
+    return "".join(c for c in texto if not unicodedata.combining(c))
 
 
-# Regex de cada palabra clave, ya normalizada y con limites de palabra.
-_PATRONES = [
-    (kw, re.compile(r"\b" + re.escape(normaliza(kw)) + r"\b"))
-    for kw in PALABRAS_CLAVE
-]
+_PATRONES = [(kw, re.compile(r"\b" + re.escape(normaliza(kw)) + r"\b"))
+             for kw in PALABRAS_CLAVE]
 
 
-def buscar_coincidencias(texto: str):
-    """Devuelve lista de (palabra_clave, fragmento_contexto)."""
+def buscar_coincidencias(texto):
     norm = normaliza(texto)
-    hallazgos = []
-    vistos = set()
+    hallazgos, vistos = [], set()
     for kw, patron in _PATRONES:
         m = patron.search(norm)
         if m and kw not in vistos:
             vistos.add(kw)
             ini = max(0, m.start() - 60)
             fin = min(len(texto), m.end() + 60)
-            # Tomamos el fragmento del texto ORIGINAL (con acentos) por posicion
-            fragmento = texto[ini:fin].replace("\n", " ").strip()
-            fragmento = re.sub(r"\s+", " ", fragmento)
-            hallazgos.append((kw, fragmento))
+            frag = re.sub(r"\s+", " ", texto[ini:fin]).strip()
+            hallazgos.append((kw, frag))
     return hallazgos
 
 
@@ -96,239 +73,224 @@ def cargar_estado():
     return set()
 
 
-def guardar_estado(vistos: set):
+def guardar_estado(vistos):
     ESTADO.parent.mkdir(parents=True, exist_ok=True)
-    ESTADO.write_text(
-        json.dumps(sorted(vistos), ensure_ascii=False, indent=0),
-        encoding="utf-8",
-    )
+    ESTADO.write_text(json.dumps(sorted(vistos), ensure_ascii=False),
+                      encoding="utf-8")
 
 
-# ---------------------------------------------------------------------------
-# Scraping
-# ---------------------------------------------------------------------------
-def extraer_lista_concursos(page):
-    """
-    Devuelve una lista de dicts: {id, numero, descripcion, url_detalle}.
+def leer_token(page):
+    try:
+        return page.get_attribute(
+            "input[name='__RequestVerificationToken']", "value") or ""
+    except Exception:
+        return ""
 
-    >>> ZONA A AFINAR <<<
-    Estrategia generica: busca cualquier tabla y filas que contengan un enlace
-    hacia 'Detalle'. Cuando veamos el HTML real (carpeta depuracion/) ajustamos
-    los selectores exactos aqui.
-    """
-    concursos = []
 
-    # Guardamos evidencia para depurar / afinar selectores luego.
+def obtener_lista(page, token):
+    datos = {
+        "__RequestVerificationToken": token,
+        "TipoProcedimientoClave": "", "TipoContratacionClave": "",
+        "IdEntidadFederativa": "", "Numero": "", "Descripcion": "",
+        "EstadoProcedimientoContratacionClave": "", "FechaPublicacion": "",
+        "FechaPublicacionIni": "", "FechaPublicacionFin": "",
+        "TestigoSocial": "", "idCaracterProcedimiento": "", "Modalidad": "",
+    }
+    headers = {"X-Requested-With": "XMLHttpRequest", "Referer": URL_INICIO}
+    resp = page.request.post(URL_BUSQUEDA, form=datos, headers=headers,
+                             timeout=60000)
     DIR_DEBUG.mkdir(parents=True, exist_ok=True)
+    cuerpo = resp.text()
+    (DIR_DEBUG / ("busqueda_%s.json" % HOY)).write_text(
+        cuerpo[:200000], encoding="utf-8")
+    if not resp.ok:
+        print("[busqueda] HTTP %s" % resp.status)
+        return []
     try:
-        page.screenshot(path=str(DIR_DEBUG / f"pantalla_{HOY}.png"), full_page=True)
-        (DIR_DEBUG / f"pagina_{HOY}.html").write_text(page.content(), encoding="utf-8")
+        data = json.loads(cuerpo)
     except Exception as e:
-        print(f"[debug] no se pudo guardar evidencia: {e}")
-
-    # Intento 1: enlaces que apuntan a la vista de detalle del concurso.
-    enlaces = page.locator("a[href*='Detalle'], a[href*='detalle']")
-    n = enlaces.count()
-    print(f"[lista] enlaces a detalle encontrados: {n}")
-
-    for i in range(n):
-        try:
-            a = enlaces.nth(i)
-            href = a.get_attribute("href") or ""
-            texto_fila = ""
-            # Subimos a la fila de la tabla para tomar numero/descripcion
-            fila = a.locator("xpath=ancestor::tr[1]")
-            if fila.count() > 0:
-                texto_fila = fila.inner_text(timeout=2000)
-            else:
-                texto_fila = a.inner_text(timeout=2000)
-
-            url = href if href.startswith("http") else BASE + href
-            # ID = parametro Id de la URL, o el href completo si no hay
-            m = re.search(r"[?&]Id=([^&]+)", href)
-            ident = m.group(1) if m else href
-
-            concursos.append({
-                "id": ident,
-                "numero": _primer_codigo(texto_fila),
-                "descripcion": " ".join(texto_fila.split())[:300],
-                "url_detalle": url,
-            })
-        except Exception as e:
-            print(f"[lista] fila {i} omitida: {e}")
-
-    # Deduplicar por id
-    unicos = {}
-    for c in concursos:
-        unicos[c["id"]] = c
-    return list(unicos.values())
+        print("[busqueda] respuesta no es JSON: %s" % e)
+        return []
+    if not isinstance(data, list):
+        print("[busqueda] respuesta inesperada")
+        return []
+    print("[busqueda] concursos recibidos: %d" % len(data))
+    return data
 
 
-def _primer_codigo(texto: str) -> str:
-    """Intenta extraer un numero de procedimiento tipo 'CFE-0013-...'."""
-    m = re.search(r"CFE[-\w]+", texto)
-    return m.group(0) if m else "(sin numero)"
+def _campo(d, *nombres):
+    for n in nombres:
+        if n in d and d[n] not in (None, ""):
+            return d[n]
+    return ""
 
 
-def obtener_links_anexos(page, url_detalle):
-    """Abre el detalle del concurso y regresa las URLs de los anexos (PDF)."""
-    links = []
+def normaliza_concurso(d):
+    return {
+        "numero": str(_campo(d, "Numero", "numero", "NumeroProcedimiento")),
+        "descripcion": str(_campo(d, "Descripcion", "descripcion")),
+        "entidad": str(_campo(d, "EntidadFederativa", "entidadFederativa")),
+        "fecha": str(_campo(d, "FechaPublicacion", "fechaPublicacion")),
+        "estado": str(_campo(d, "EstadoProcedimiento", "estadoProcedimiento")),
+        "id": str(_campo(d, "Id", "id", "IdProcedimiento", "idProcedimiento")),
+    }
+
+
+def obtener_anexos(page, token, id_proc, guardar_muestra=False):
+    if not id_proc:
+        return []
+    headers = {"X-Requested-With": "XMLHttpRequest", "Referer": URL_INICIO}
     try:
-        page.goto(url_detalle, wait_until="domcontentloaded", timeout=45000)
-        page.wait_for_timeout(2500)
-    except Exception as e:
-        print(f"[detalle] no abrio {url_detalle}: {e}")
-        return links
-
-    # GetAnexo es el endpoint tipico de descarga de anexos en el MSC.
-    anclas = page.locator("a[href*='GetAnexo'], a[href*='Anexo'], a[href$='.pdf']")
-    for i in range(min(anclas.count(), MAX_ANEXOS)):
-        href = anclas.nth(i).get_attribute("href") or ""
-        if not href:
-            continue
-        url = href if href.startswith("http") else BASE + href
-        links.append(url)
-    return list(dict.fromkeys(links))  # dedup conservando orden
-
-
-def descargar_y_extraer(contexto, url):
-    """Descarga un anexo usando la sesion del navegador y extrae su texto."""
-    try:
-        resp = contexto.request.get(url, timeout=60000)
+        resp = page.request.post(
+            URL_DETALLE,
+            form={"id": id_proc, "__RequestVerificationToken": token},
+            headers=headers, timeout=60000)
         if not resp.ok:
-            print(f"[anexo] {resp.status} en {url}")
+            return []
+        html = resp.text()
+    except Exception as e:
+        print("[detalle] error id %s: %s" % (id_proc, e))
+        return []
+
+    if guardar_muestra:
+        DIR_DEBUG.mkdir(parents=True, exist_ok=True)
+        (DIR_DEBUG / ("detalle_muestra_%s.html" % HOY)).write_text(
+            html[:300000], encoding="utf-8")
+
+    urls = set()
+    for m in re.finditer(r'href=["\']([^"\']*(?:GetAnexo|Anexo)[^"\']*)["\']',
+                         html, re.IGNORECASE):
+        urls.add(m.group(1))
+    for m in re.finditer(r'href=["\']([^"\']*\.pdf[^"\']*)["\']',
+                         html, re.IGNORECASE):
+        urls.add(m.group(1))
+    for m in re.finditer(r'(Procedure/GetAnexo/\d+)', html, re.IGNORECASE):
+        urls.add(m.group(1))
+
+    absolutas = []
+    for u in urls:
+        if u.startswith("http"):
+            absolutas.append(u)
+        elif u.startswith("/"):
+            absolutas.append("https://msc.cfe.mx" + u)
+        else:
+            absolutas.append(BASE + u.lstrip("/"))
+    return list(dict.fromkeys(absolutas))[:MAX_ANEXOS]
+
+
+def descargar_y_extraer(page, url):
+    try:
+        resp = page.request.get(url, timeout=60000)
+        if not resp.ok:
             return ""
         datos = resp.body()
         if len(datos) > MAX_PDF_MB * 1024 * 1024:
-            print(f"[anexo] demasiado grande, omitido: {url}")
             return ""
-        # Solo intentamos extraer texto si parece PDF
         if datos[:4] != b"%PDF":
             return ""
         return extract_text(io.BytesIO(datos)) or ""
     except Exception as e:
-        print(f"[anexo] error con {url}: {e}")
+        print("[anexo] error %s: %s" % (url, e))
         return ""
 
 
-# ---------------------------------------------------------------------------
-# Reporte
-# ---------------------------------------------------------------------------
 def escribir_reportes(hallazgos):
     DIR_REPORTES.mkdir(parents=True, exist_ok=True)
     DIR_SALIDA.mkdir(parents=True, exist_ok=True)
-
-    ruta_md = DIR_REPORTES / f"{HOY}.md"
-    lineas = [f"# Concursos CFE con recubrimientos / pinturas — {HOY}", ""]
-
+    lineas = ["# Concursos CFE con recubrimientos / pinturas - %s" % HOY, ""]
     if not hallazgos:
         lineas.append("Sin coincidencias nuevas hoy.")
     else:
-        lineas.append(f"**{len(hallazgos)} concurso(s) con coincidencias:**")
-        lineas.append("")
+        lineas.append("**%d concurso(s) con coincidencias:**\n" % len(hallazgos))
         for h in hallazgos:
-            lineas.append(f"## {h['numero']}")
-            lineas.append(f"- **Descripcion:** {h['descripcion']}")
-            lineas.append(f"- **Detalle:** {h['url_detalle']}")
             kws = ", ".join(sorted({k for k, _ in h["coincidencias"]}))
-            lineas.append(f"- **Palabras encontradas:** {kws}")
-            lineas.append(f"- **Donde:** {h['fuente']}")
-            # Un fragmento de ejemplo
+            lineas += [
+                "## %s  (%s)" % (h["numero"], h["entidad"]),
+                "- **Descripcion:** %s" % h["descripcion"],
+                "- **Fecha publicacion:** %s" % h["fecha"],
+                "- **Palabras encontradas:** %s" % kws,
+                "- **Detectado en:** %s" % h["fuente"],
+            ]
             if h["coincidencias"]:
-                kw, frag = h["coincidencias"][0]
-                lineas.append(f"- **Contexto:** ...{frag}...")
+                _, frag = h["coincidencias"][0]
+                lineas.append("- **Contexto:** ...%s..." % frag)
             lineas.append("")
-
     contenido = "\n".join(lineas)
-    ruta_md.write_text(contenido, encoding="utf-8")
-    print(f"[reporte] escrito en {ruta_md}")
-
-    # Solo creamos el archivo para el Issue si HAY hallazgos
+    (DIR_REPORTES / ("%s.md" % HOY)).write_text(contenido, encoding="utf-8")
+    print("[reporte] %s.md" % HOY)
     if hallazgos:
         (DIR_SALIDA / "nuevo_issue.md").write_text(contenido, encoding="utf-8")
-        print("[reporte] salida/nuevo_issue.md generado (habra Issue)")
+        print("[reporte] salida/nuevo_issue.md generado")
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 def main():
     vistos = cargar_estado()
-    print(f"[estado] concursos ya vistos: {len(vistos)}")
-
+    print("[estado] ya vistos: %d" % len(vistos))
     hallazgos = []
 
     with sync_playwright() as p:
         navegador = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
-        )
-        contexto = navegador.new_context(
-            locale="es-MX",
-            timezone_id="America/Mexico_City",
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1366, "height": 900},
-        )
-        # Pequeno truco para ocultar el flag de automatizacion
-        contexto.add_init_script(
-            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-        )
-        page = contexto.new_page()
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"])
+        ctx = navegador.new_context(
+            locale="es-MX", timezone_id="America/Mexico_City",
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"),
+            viewport={"width": 1366, "height": 900})
+        ctx.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+        page = ctx.new_page()
 
-        print(f"[nav] abriendo {URL_INICIO}")
+        print("[nav] abriendo %s" % URL_INICIO)
         page.goto(URL_INICIO, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(4000)
+        page.wait_for_timeout(3500)
 
-        concursos = extraer_lista_concursos(page)
-        print(f"[lista] concursos detectados: {len(concursos)}")
+        token = leer_token(page)
+        print("[token] %s" % ("ok" if token else "NO ENCONTRADO"))
 
-        nuevos = [c for c in concursos if c["id"] not in vistos]
-        print(f"[lista] concursos NUEVOS: {len(nuevos)}")
+        crudos = obtener_lista(page, token)
+        concursos = [normaliza_concurso(c) for c in crudos]
+        concursos = [c for c in concursos if c["numero"]]
+        nuevos = [c for c in concursos if c["numero"] not in vistos]
+        print("[lista] total=%d nuevos=%d" % (len(concursos), len(nuevos)))
 
+        detalles = 0
+        muestra = True
         for c in nuevos:
-            vistos.add(c["id"])
-            fuente = None
-            coincidencias = buscar_coincidencias(c["descripcion"])
-            if coincidencias:
-                fuente = "descripcion"
-
-            # Si la descripcion no basta, revisamos los anexos PDF
-            if not coincidencias:
-                anexos = obtener_links_anexos(page, c["url_detalle"])
-                print(f"[detalle] {c['numero']}: {len(anexos)} anexo(s)")
+            vistos.add(c["numero"])
+            co = buscar_coincidencias(c["descripcion"])
+            fuente = "descripcion" if co else None
+            if not co and detalles < MAX_DETALLES:
+                detalles += 1
+                anexos = obtener_anexos(page, token, c["id"],
+                                        guardar_muestra=muestra)
+                muestra = False
                 for url in anexos:
-                    texto = descargar_y_extraer(contexto, url)
-                    if not texto:
-                        continue
-                    co = buscar_coincidencias(texto)
-                    if co:
-                        coincidencias = co
-                        fuente = url
-                        break
-
-            if coincidencias:
-                c["coincidencias"] = coincidencias
+                    texto = descargar_y_extraer(page, url)
+                    if texto:
+                        cc = buscar_coincidencias(texto)
+                        if cc:
+                            co, fuente = cc, url
+                            break
+            if co:
+                c["coincidencias"] = co
                 c["fuente"] = fuente
                 hallazgos.append(c)
-                print(f"[HALLAZGO] {c['numero']} -> {[k for k,_ in coincidencias]}")
+                print("[HALLAZGO] %s -> %s" % (c["numero"], [k for k, _ in co]))
 
         navegador.close()
 
     escribir_reportes(hallazgos)
     guardar_estado(vistos)
-    print(f"[fin] hallazgos hoy: {len(hallazgos)}")
+    print("[fin] hallazgos: %d" % len(hallazgos))
 
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
-        # No queremos que el workflow truene; guardamos lo que se pueda.
-        print(f"[ERROR] {e}", file=sys.stderr)
+        print("[ERROR] %s" % e, file=sys.stderr)
         DIR_DEBUG.mkdir(parents=True, exist_ok=True)
-        (DIR_DEBUG / f"error_{HOY}.txt").write_text(str(e), encoding="utf-8")
+        (DIR_DEBUG / ("error_%s.txt" % HOY)).write_text(str(e), encoding="utf-8")
         sys.exit(0)
