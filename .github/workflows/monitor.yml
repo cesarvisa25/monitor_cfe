@@ -39,7 +39,8 @@ jobs:
         run: |
           gh issue create \
             --title "Licitaciones CFE con recubrimientos/pinturas — $(date +%F)" \
-            --body-file salida/nuevo_issue.md
+            --body-file salida/nuevo_issue.md \
+            --assignee cesarvisa25
 
       - name: Subir reporte y archivos de depuracion
         if: always()
