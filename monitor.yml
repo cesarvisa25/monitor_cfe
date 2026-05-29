@@ -1,0 +1,61 @@
+name: Monitor CFE Concursos
+
+on:
+  # Corre de lunes a viernes a las 14:00 UTC = 8:00 am en Monclova (UTC-6)
+  schedule:
+    - cron: "0 14 * * 1-5"
+  # Permite correrlo a mano desde la pestana Actions
+  workflow_dispatch:
+
+permissions:
+  contents: write   # para guardar el estado (vistos.json) y los reportes
+  issues: write     # para abrir el Issue con los hallazgos
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Instalar navegador Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Ejecutar monitor
+        run: python monitor.py
+
+      - name: Crear Issue si hubo hallazgos
+        if: ${{ hashFiles('salida/nuevo_issue.md') != '' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh issue create \
+            --title "Licitaciones CFE con recubrimientos/pinturas — $(date +%F)" \
+            --body-file salida/nuevo_issue.md
+
+      - name: Subir reporte y archivos de depuracion
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-${{ github.run_number }}
+          path: |
+            reportes/
+            depuracion/
+          if-no-files-found: ignore
+
+      - name: Guardar estado en el repo
+        if: always()
+        run: |
+          git config user.name "cfe-monitor-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add estado/ reportes/ 2>/dev/null || true
+          git commit -m "Estado y reporte $(date +%F)" || echo "Sin cambios que guardar"
+          git push || echo "Nada que enviar"
