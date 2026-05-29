@@ -94,6 +94,8 @@ JS_LEER_GRID = r"""
         EntidadFederativa: x.EntidadFederativa,
         FechaPublicacion: x.FechaPublicacion,
         EstadoProcedimiento: x.EstadoProcedimiento,
+        TipoContratacionClave: x.TipoContratacionClave,
+        TipoProcedimientoClave: x.TipoProcedimientoClave,
         Id: x.Id
       });
     }
@@ -156,6 +158,10 @@ def normaliza_concurso(d):
         "entidad": str(_campo(d, "EntidadFederativa", "entidadFederativa")),
         "fecha": str(_campo(d, "FechaPublicacion", "fechaPublicacion")),
         "estado": str(_campo(d, "EstadoProcedimiento", "estadoProcedimiento")),
+        "tipo_contratacion": str(_campo(d, "TipoContratacionClave",
+                                        "tipoContratacionClave")),
+        "tipo_procedimiento": str(_campo(d, "TipoProcedimientoClave",
+                                         "tipoProcedimientoClave")),
         "id": str(_campo(d, "Id", "id")),
     }
 
@@ -230,6 +236,7 @@ def _bloques(hallazgos):
         lineas += [
             "## %s  (%s)" % (h["numero"], h["entidad"]),
             "- **Descripcion:** %s" % h["descripcion"],
+            "- **Tipo de contratacion:** %s" % (h.get("tipo_contratacion") or "-"),
             "- **Fecha publicacion:** %s" % h["fecha"],
             "- **Palabras encontradas:** %s" % kws,
             "- **Detectado en:** %s" % h["fuente"],
