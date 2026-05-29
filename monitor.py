@@ -1,12 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Monitor de concursos de CFE (Micrositio de Concursos / MSC) - v2
+Monitor de concursos de CFE (Micrositio de Concursos / MSC) - v2.1
 
-Ajustado a la estructura real del portal:
-  - La lista de concursos se obtiene del endpoint Procedure/getProcBusqueda
-    (es lo que hace el boton "Buscar" de la pagina).
-  - El detalle de cada concurso (con sus anexos PDF) se obtiene de
-    Procedure/Details enviando el Id del procedimiento.
+Enfoque robusto: en vez de imitar la peticion AJAX (que el servidor rechaza
+con error 500), el robot hace CLIC en el boton "Buscar" real de la pagina y
+luego lee la tabla de resultados directo de la memoria del navegador
+(el dataSource de Kendo UI). Asi la pagina usa su propio token y todo cuadra.
+
+  1. Abre la pagina y hace clic en "Buscar" (sin filtros = todos los vigentes).
+  2. Lee la lista completa de concursos del grid.
+  3. Detecta los NUEVOS (compara contra estado/vistos.json por numero).
+  4. Filtra por palabras clave: primero en la descripcion; si no, abre el
+     detalle (ventana real) y revisa los anexos PDF.
+  5. Escribe reporte y, si hay hallazgos, genera salida/nuevo_issue.md.
 """
 
 import io
@@ -24,8 +30,6 @@ from keywords import PALABRAS_CLAVE
 
 BASE = "https://msc.cfe.mx/Aplicaciones/NCFE/Concursos/"
 URL_INICIO = BASE
-URL_BUSQUEDA = BASE + "Procedure/getProcBusqueda"
-URL_DETALLE = BASE + "Procedure/Details"
 
 RAIZ = Path(__file__).parent
 ESTADO = RAIZ / "estado" / "vistos.json"
@@ -33,13 +37,14 @@ DIR_REPORTES = RAIZ / "reportes"
 DIR_SALIDA = RAIZ / "salida"
 DIR_DEBUG = RAIZ / "depuracion"
 
-MAX_ANEXOS = 15
+MAX_ANEXOS = 12
 MAX_PDF_MB = 25
-MAX_DETALLES = 120
+MAX_DETALLES = 30   # cuantos detalles abrir por corrida (para no eternizarse)
 
 HOY = datetime.now().strftime("%Y-%m-%d")
 
 
+# ----------------------- Coincidencias -----------------------
 def normaliza(texto):
     texto = (texto or "").lower()
     texto = unicodedata.normalize("NFKD", texto)
@@ -64,6 +69,7 @@ def buscar_coincidencias(texto):
     return hallazgos
 
 
+# ----------------------- Estado -----------------------
 def cargar_estado():
     if ESTADO.exists():
         try:
@@ -79,43 +85,67 @@ def guardar_estado(vistos):
                       encoding="utf-8")
 
 
-def leer_token(page):
-    try:
-        return page.get_attribute(
-            "input[name='__RequestVerificationToken']", "value") or ""
-    except Exception:
-        return ""
-
-
-def obtener_lista(page, token):
-    datos = {
-        "__RequestVerificationToken": token,
-        "TipoProcedimientoClave": "", "TipoContratacionClave": "",
-        "IdEntidadFederativa": "", "Numero": "", "Descripcion": "",
-        "EstadoProcedimientoContratacionClave": "", "FechaPublicacion": "",
-        "FechaPublicacionIni": "", "FechaPublicacionFin": "",
-        "TestigoSocial": "", "idCaracterProcedimiento": "", "Modalidad": "",
+# ----------------------- Lista de concursos -----------------------
+JS_LEER_GRID = r"""
+() => {
+  try {
+    if (!window.$jq1) return null;
+    var g = $jq1('#gridProcesos').data('kendoGrid');
+    if (!g || !g.dataSource) return null;
+    var d = g.dataSource.data();
+    var out = [];
+    for (var i = 0; i < d.length; i++) {
+      var x = d[i];
+      out.push({
+        Numero: x.Numero, Descripcion: x.Descripcion,
+        EntidadFederativa: x.EntidadFederativa,
+        FechaPublicacion: x.FechaPublicacion,
+        EstadoProcedimiento: x.EstadoProcedimiento,
+        Id: x.Id
+      });
     }
-    headers = {"X-Requested-With": "XMLHttpRequest", "Referer": URL_INICIO}
-    resp = page.request.post(URL_BUSQUEDA, form=datos, headers=headers,
-                             timeout=60000)
+    return out;
+  } catch (e) { return null; }
+}
+"""
+
+
+def obtener_lista(page):
+    """Hace clic en Buscar y lee el grid. Devuelve lista de dicts."""
     DIR_DEBUG.mkdir(parents=True, exist_ok=True)
-    cuerpo = resp.text()
-    (DIR_DEBUG / ("busqueda_%s.json" % HOY)).write_text(
-        cuerpo[:200000], encoding="utf-8")
-    if not resp.ok:
-        print("[busqueda] HTTP %s" % resp.status)
-        return []
+    # Clic en el boton Buscar
     try:
-        data = json.loads(cuerpo)
+        page.click("#buscar", timeout=15000)
     except Exception as e:
-        print("[busqueda] respuesta no es JSON: %s" % e)
+        print("[lista] no se pudo clic en #buscar: %s" % e)
+
+    # Esperar a que el grid de Kendo tenga datos (hasta ~40s)
+    datos = None
+    for intento in range(40):
+        page.wait_for_timeout(1000)
+        try:
+            datos = page.evaluate(JS_LEER_GRID)
+        except Exception:
+            datos = None
+        if datos:
+            break
+
+    # Guardar evidencia siempre
+    try:
+        page.screenshot(path=str(DIR_DEBUG / ("pantalla_%s.png" % HOY)),
+                        full_page=True)
+        (DIR_DEBUG / ("pagina_%s.html" % HOY)).write_text(
+            page.content(), encoding="utf-8")
+    except Exception:
+        pass
+
+    if not datos:
+        print("[lista] el grid no devolvio datos")
         return []
-    if not isinstance(data, list):
-        print("[busqueda] respuesta inesperada")
-        return []
-    print("[busqueda] concursos recibidos: %d" % len(data))
-    return data
+    print("[lista] concursos leidos del grid: %d" % len(datos))
+    (DIR_DEBUG / ("lista_%s.json" % HOY)).write_text(
+        json.dumps(datos, ensure_ascii=False)[:200000], encoding="utf-8")
+    return datos
 
 
 def _campo(d, *nombres):
@@ -127,44 +157,49 @@ def _campo(d, *nombres):
 
 def normaliza_concurso(d):
     return {
-        "numero": str(_campo(d, "Numero", "numero", "NumeroProcedimiento")),
+        "numero": str(_campo(d, "Numero", "numero")),
         "descripcion": str(_campo(d, "Descripcion", "descripcion")),
         "entidad": str(_campo(d, "EntidadFederativa", "entidadFederativa")),
         "fecha": str(_campo(d, "FechaPublicacion", "fechaPublicacion")),
         "estado": str(_campo(d, "EstadoProcedimiento", "estadoProcedimiento")),
-        "id": str(_campo(d, "Id", "id", "IdProcedimiento", "idProcedimiento")),
+        "id": str(_campo(d, "Id", "id")),
     }
 
 
-def obtener_anexos(page, token, id_proc, guardar_muestra=False):
+# ----------------------- Detalle / anexos -----------------------
+def obtener_anexos(ctx, page, id_proc, guardar_muestra=False):
+    """Abre el detalle (ventana real) via MostrarDetalle y saca URLs de PDF."""
     if not id_proc:
         return []
-    headers = {"X-Requested-With": "XMLHttpRequest", "Referer": URL_INICIO}
+    pop = None
     try:
-        resp = page.request.post(
-            URL_DETALLE,
-            form={"id": id_proc, "__RequestVerificationToken": token},
-            headers=headers, timeout=60000)
-        if not resp.ok:
-            return []
-        html = resp.text()
+        with ctx.expect_page(timeout=20000) as pinfo:
+            page.evaluate("(id) => { MostrarDetalle(id); }", id_proc)
+        pop = pinfo.value
+        pop.wait_for_load_state("domcontentloaded", timeout=20000)
+        pop.wait_for_timeout(1500)
+        html = pop.content()
     except Exception as e:
-        print("[detalle] error id %s: %s" % (id_proc, e))
+        print("[detalle] id %s: %s" % (id_proc, e))
+        if pop:
+            try:
+                pop.close()
+            except Exception:
+                pass
         return []
 
     if guardar_muestra:
-        DIR_DEBUG.mkdir(parents=True, exist_ok=True)
-        (DIR_DEBUG / ("detalle_muestra_%s.html" % HOY)).write_text(
-            html[:300000], encoding="utf-8")
+        try:
+            (DIR_DEBUG / ("detalle_muestra_%s.html" % HOY)).write_text(
+                html[:300000], encoding="utf-8")
+        except Exception:
+            pass
 
     urls = set()
-    for m in re.finditer(r'href=["\']([^"\']*(?:GetAnexo|Anexo)[^"\']*)["\']',
-                         html, re.IGNORECASE):
+    for m in re.finditer(r'(GetAnexo/\d+)', html, re.IGNORECASE):
         urls.add(m.group(1))
     for m in re.finditer(r'href=["\']([^"\']*\.pdf[^"\']*)["\']',
                          html, re.IGNORECASE):
-        urls.add(m.group(1))
-    for m in re.finditer(r'(Procedure/GetAnexo/\d+)', html, re.IGNORECASE):
         urls.add(m.group(1))
 
     absolutas = []
@@ -175,25 +210,29 @@ def obtener_anexos(page, token, id_proc, guardar_muestra=False):
             absolutas.append("https://msc.cfe.mx" + u)
         else:
             absolutas.append(BASE + u.lstrip("/"))
-    return list(dict.fromkeys(absolutas))[:MAX_ANEXOS]
+    absolutas = list(dict.fromkeys(absolutas))[:MAX_ANEXOS]
 
-
-def descargar_y_extraer(page, url):
+    # Descargar y extraer texto de cada PDF (usando la ventana de detalle)
+    textos = []
+    for url in absolutas:
+        try:
+            resp = pop.request.get(url, timeout=60000)
+            if not resp.ok:
+                continue
+            b = resp.body()
+            if len(b) > MAX_PDF_MB * 1024 * 1024 or b[:4] != b"%PDF":
+                continue
+            textos.append(extract_text(io.BytesIO(b)) or "")
+        except Exception:
+            continue
     try:
-        resp = page.request.get(url, timeout=60000)
-        if not resp.ok:
-            return ""
-        datos = resp.body()
-        if len(datos) > MAX_PDF_MB * 1024 * 1024:
-            return ""
-        if datos[:4] != b"%PDF":
-            return ""
-        return extract_text(io.BytesIO(datos)) or ""
-    except Exception as e:
-        print("[anexo] error %s: %s" % (url, e))
-        return ""
+        pop.close()
+    except Exception:
+        pass
+    return textos
 
 
+# ----------------------- Reporte -----------------------
 def escribir_reportes(hallazgos):
     DIR_REPORTES.mkdir(parents=True, exist_ok=True)
     DIR_SALIDA.mkdir(parents=True, exist_ok=True)
@@ -223,6 +262,7 @@ def escribir_reportes(hallazgos):
         print("[reporte] salida/nuevo_issue.md generado")
 
 
+# ----------------------- Main -----------------------
 def main():
     vistos = cargar_estado()
     print("[estado] ya vistos: %d" % len(vistos))
@@ -244,12 +284,9 @@ def main():
 
         print("[nav] abriendo %s" % URL_INICIO)
         page.goto(URL_INICIO, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(3500)
+        page.wait_for_timeout(4000)
 
-        token = leer_token(page)
-        print("[token] %s" % ("ok" if token else "NO ENCONTRADO"))
-
-        crudos = obtener_lista(page, token)
+        crudos = obtener_lista(page)
         concursos = [normaliza_concurso(c) for c in crudos]
         concursos = [c for c in concursos if c["numero"]]
         nuevos = [c for c in concursos if c["numero"] not in vistos]
@@ -263,16 +300,14 @@ def main():
             fuente = "descripcion" if co else None
             if not co and detalles < MAX_DETALLES:
                 detalles += 1
-                anexos = obtener_anexos(page, token, c["id"],
+                textos = obtener_anexos(ctx, page, c["id"],
                                         guardar_muestra=muestra)
                 muestra = False
-                for url in anexos:
-                    texto = descargar_y_extraer(page, url)
-                    if texto:
-                        cc = buscar_coincidencias(texto)
-                        if cc:
-                            co, fuente = cc, url
-                            break
+                for texto in textos:
+                    cc = buscar_coincidencias(texto)
+                    if cc:
+                        co, fuente = cc, "anexo PDF"
+                        break
             if co:
                 c["coincidencias"] = co
                 c["fuente"] = fuente
